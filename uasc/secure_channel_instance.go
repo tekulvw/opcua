@@ -5,6 +5,7 @@
 package uasc
 
 import (
+	"context"
 	"encoding/binary"
 	"math"
 	"sync"
@@ -57,7 +58,7 @@ func (c *channelInstance) nextSequenceNumber() uint32 {
 	return c.sequenceNumber
 }
 
-func (c *channelInstance) newRequestMessage(req ua.Request, reqID uint32, authToken *ua.NodeID, timeout time.Duration) (*Message, error) {
+func (c *channelInstance) newRequestMessage(ctx context.Context, req ua.Request, reqID uint32, authToken *ua.NodeID) (*Message, error) {
 	typeID := ua.ServiceTypeID(req)
 	if typeID == 0 {
 		return nil, errors.Errorf("unknown service %T. Did you call register?", req)
@@ -72,10 +73,21 @@ func (c *channelInstance) newRequestMessage(req ua.Request, reqID uint32, authTo
 		RequestHandle:       reqID, // TODO: can I cheat like this?
 	}
 
-	if timeout > 0 && timeout < c.sc.cfg.RequestTimeout {
-		timeout = c.sc.cfg.RequestTimeout
+	var timeoutHint uint32
+
+	if when, set := ctx.Deadline(); set && when.Sub(time.Now()) < c.sc.cfg.RequestTimeout {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithTimeout(context.Background(), c.sc.cfg.RequestTimeout)
+		defer cancel()
+
+		timeoutHint = uint32(c.sc.cfg.RequestTimeout / time.Millisecond)
+	} else if set {
+		timeoutHint = uint32(when.Sub(time.Now()) / time.Millisecond)
 	}
-	reqHdr.TimeoutHint = uint32(timeout / time.Millisecond)
+
+	reqHdr.TimeoutHint = timeoutHint
+
 	req.SetHeader(reqHdr)
 
 	// encode the message

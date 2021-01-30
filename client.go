@@ -750,13 +750,16 @@ func (c *Client) DetachSession() (*Session, error) {
 // the response. If the client has an active session it injects the
 // authentication token.
 func (c *Client) Send(req ua.Request, h func(interface{}) error) error {
-	return c.sendWithTimeout(req, c.cfg.RequestTimeout, h)
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
+	defer cancel()
+
+	return c.sendWithTimeout(ctx, req, h)
 }
 
 // sendWithTimeout sends the request via the secure channel with a custom timeout and registers a handler for
 // the response. If the client has an active session it injects the
 // authentication token.
-func (c *Client) sendWithTimeout(req ua.Request, timeout time.Duration, h func(interface{}) error) error {
+func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, h func(interface{}) error) error {
 	if c.sechan == nil {
 		return ua.StatusBadServerNotConnected
 	}
@@ -764,7 +767,7 @@ func (c *Client) sendWithTimeout(req ua.Request, timeout time.Duration, h func(i
 	if s := c.Session(); s != nil {
 		authToken = s.resp.AuthenticationToken
 	}
-	return c.sechan.SendRequestWithTimeout(req, authToken, timeout, h)
+	return c.sechan.SendRequestWithTimeout(ctx, req, authToken, h)
 }
 
 // Node returns a node object which accesses its attributes

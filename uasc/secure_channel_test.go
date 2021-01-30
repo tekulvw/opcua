@@ -1,6 +1,7 @@
 package uasc
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
@@ -18,8 +19,8 @@ func TestNewRequestMessage(t *testing.T) {
 		if instance == nil {
 			instance = newChannelInstance(sc)
 		}
-		sc.activeInstance = instance
-		sc.activeInstance.sc = sc
+		sc.ci = instance
+		sc.ci.sc = sc
 		return sc
 	}
 
@@ -137,11 +138,16 @@ func TestNewRequestMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m, err := tt.sechan.activeInstance.newRequestMessage(tt.req, tt.sechan.nextRequestID(), tt.authToken, tt.timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), tt.timeout)
+
+			m, err := tt.sechan.ci.newRequestMessage(ctx, tt.req, tt.sechan.nextRequestID(), tt.authToken)
 			if err != nil {
 				t.Fatalf("got err %v want nil", err)
 			}
+
 			verify.Values(t, "", m, tt.m)
+
+			cancel()
 		})
 	}
 }

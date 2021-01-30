@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"math"
 	"sync"
@@ -33,39 +34,9 @@ type response struct {
 	Err   error
 }
 
-type conditionLocker struct {
-	bLock   bool
-	lockMu  sync.Mutex
-	lockCnd *sync.Cond
-}
-
-func newConditionLocker() *conditionLocker {
-	c := conditionLocker{
-		bLock: false,
-	}
-	c.lockCnd = sync.NewCond(&c.lockMu)
-	return &c
-}
-
-func (c *conditionLocker) lock() {
-	c.lockMu.Lock()
-	defer c.lockMu.Unlock()
-	c.bLock = true
-}
-
-func (c *conditionLocker) unlock() {
-	c.lockMu.Lock()
-	defer c.lockMu.Unlock()
-	c.bLock = false
-	c.lockCnd.Broadcast()
-}
-
-func (c *conditionLocker) waitIfLock() {
-	c.lockMu.Lock()
-	defer c.lockMu.Unlock()
-	for c.bLock {
-		c.lockCnd.Wait()
-	}
+type activeRequest struct {
+	instance *channelInstance
+	resp     chan *response
 }
 
 type SecureChannel struct {
@@ -80,47 +51,29 @@ type SecureChannel struct {
 	// time returns the current time. When not set it defaults to time.Now().
 	time func() time.Time
 
-	// closing is channel used to indicate to go routines that the secure channel is closing
-	closing      chan struct{}
-	disconnected chan struct{}
-
-	// closingMu is used to protect the _changing_ of the mutex
-	// i.e. when we _read_ from the closing chan we acquire a read lock, and when in `reset`, we acquire a write lock
-	closingMu sync.RWMutex
-
 	// startDispatcher ensures only one dispatcher is running
 	startDispatcher sync.Once
 
 	// requestID is a "global" counter shared between multiple channels and tokens
-	requestID   uint32
-	requestIDMu sync.Mutex
+	requestID uint32
 
 	// instances maps secure channel IDs to a list to channel states
-	instances      map[uint32][]*channelInstance
-	activeInstance *channelInstance
-	instancesMu    sync.Mutex
+	ci  *channelInstance
+	ciL sync.RWMutex
 
-	// prevent sending msg when secure channel renewal occurs
-	reqLocker  *conditionLocker
-	rcvLocker  *conditionLocker
-	pendingReq sync.WaitGroup
+	decryptChannel *channelInstance
+	dcL            sync.RWMutex
 
-	// handles maps request IDs to response channels
-	handlers   map[uint32]chan *response
-	handlersMu sync.Mutex
+	requests map[uint32]activeRequest
+	reqL     sync.Mutex
 
 	// chunks maintains a temporary list of chunks for a given request ID
 	chunks   map[uint32][]*MessageChunk
 	chunksMu sync.Mutex
 
-	// openingInstance is a temporary var that allows the dispatcher know how to handle a open channel request
-	// note: we only allow a single "open" request in flight at any point in time. The mutex is held for the entire
-	// duration of the "open" request.
-	openingInstance *channelInstance
-	openingMu       sync.Mutex
-
 	// errorCh receive dispatcher errors
 	errCh chan<- error
+	quit  chan struct{}
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error) (*SecureChannel, error) {
@@ -152,9 +105,8 @@ func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- e
 		c:           c,
 		cfg:         cfg,
 		requestID:   cfg.RequestIDSeed,
-		reqLocker:   newConditionLocker(),
-		rcvLocker:   newConditionLocker(),
 		errCh:       errCh,
+		quit:        make(chan struct{}),
 	}
 	s.reset()
 
@@ -162,43 +114,19 @@ func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- e
 }
 
 func (s *SecureChannel) reset() {
-	s.closingMu.Lock()
-	defer s.closingMu.Unlock()
-
-	// note: we _don't_ reset s.requestID
-	s.closing = make(chan struct{})
-	s.disconnected = make(chan struct{})
 	s.startDispatcher = sync.Once{}
-	s.instances = make(map[uint32][]*channelInstance)
 	s.chunks = make(map[uint32][]*MessageChunk)
-	s.handlers = make(map[uint32]chan *response)
-	s.activeInstance = nil
-	s.openingInstance = nil
-}
-
-func (s *SecureChannel) getActiveChannelInstance() (*channelInstance, error) {
-	s.instancesMu.Lock()
-	defer s.instancesMu.Unlock()
-	if s.activeInstance == nil {
-		return nil, errors.Errorf("sechan: secure channel not open.")
-	}
-	return s.activeInstance, nil
+	s.requests = make(map[uint32]activeRequest)
+	s.quit = make(chan struct{})
 }
 
 func (s *SecureChannel) dispatcher() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s.closingMu.RLock()
-	defer s.closingMu.RUnlock()
-
-	defer func() {
-		close(s.disconnected)
-	}()
-
 	for {
 		select {
-		case <-s.closing:
+		case <-s.quit:
 			return
 		default:
 			resp := s.receive(ctx)
@@ -220,16 +148,11 @@ func (s *SecureChannel) dispatcher() {
 				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
 			}
 
-			ch, ok := s.popHandler(resp.ReqID)
+			ch, ok := s.popActiveRequest(resp.ReqID)
 
 			if !ok {
 				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), resp.ReqID, resp.V)
 				continue
-			}
-
-			// HACK
-			if _, ok := resp.V.(*ua.OpenSecureChannelResponse); ok {
-				s.rcvLocker.lock()
 			}
 
 			debug.Printf("sending %T to handler\n", resp.V)
@@ -239,8 +162,6 @@ func (s *SecureChannel) dispatcher() {
 				// this should never happen since the chan is of size one
 				debug.Printf("unexpected state. channel write should always succeed.")
 			}
-
-			s.rcvLocker.waitIfLock()
 		}
 	}
 }
@@ -375,8 +296,6 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 		return nil, errors.Errorf("sechan: decode chunk failed: %s", err)
 	}
 
-	var decryptWith *channelInstance
-
 	switch m.MessageType {
 	case "OPN":
 		debug.Printf("uasc OPN Request")
@@ -386,18 +305,12 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 			return nil, ua.StatusBadDecodingError // todo(dh): check if this is the correct error
 		}
 
-		if s.openingInstance == nil {
-			return nil, errors.Errorf("sechan: invalid state. openingInstance is nil.")
-		}
-
 		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
 			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
 			debug.Printf("Setting securityPolicy to %s", m.SecurityPolicyURI)
 		}
 
 		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
-
-		decryptWith = s.openingInstance
 	case "CLO":
 		return nil, io.EOF
 	case "MSG":
@@ -406,11 +319,18 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 		return nil, errors.Errorf("sechan: unknown message type: %s", m.MessageType)
 	}
 
-	// Decrypt the block and put data back into m.Data
-	m.Data, err = s.verifyAndDecrypt(m, b, decryptWith)
+	s.dcL.RLock()
+
+	if s.decryptChannel == nil {
+		return nil, errors.New("receiving data with no decrypt channel, how?")
+	}
+
+	m.Data, err = s.decryptChannel.verifyAndDecrypt(m, b)
 	if err != nil {
 		return nil, err
 	}
+
+	s.dcL.RUnlock()
 
 	n, err := m.SequenceHeader.Decode(m.Data)
 	if err != nil {
@@ -421,52 +341,6 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	return m, nil
 }
 
-// verifyAndDecrypt verifies and optionally decrypts a message. if `instance` is given, then it will only use that
-// state. Otherwise it will look up states by channel ID and try each.
-func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte, instance *channelInstance) ([]byte, error) {
-	if instance != nil {
-		return instance.verifyAndDecrypt(m, b)
-	}
-
-	instances := s.getInstancesBySecureChannelID(m.MessageHeader.SecureChannelID)
-	if len(instances) == 0 {
-		return nil, errors.Errorf("sechan: unable to find instance for SecureChannelID=%d", m.MessageHeader.SecureChannelID)
-	}
-
-	var (
-		err      error
-		verified []byte
-	)
-
-	for i := len(instances) - 1; i >= 0; i-- {
-		// instances[i].Lock()
-		if verified, err = instances[i].verifyAndDecrypt(m, b); err == nil {
-			// instances[i].Unlock()
-			return verified, nil
-		}
-		// instances[i].Unlock()
-		debug.Printf("attempting an older channel state...")
-	}
-
-	return nil, err
-}
-
-func (s *SecureChannel) getInstancesBySecureChannelID(id uint32) []*channelInstance {
-	s.instancesMu.Lock()
-	defer s.instancesMu.Unlock()
-
-	instances := s.instances[id]
-	if instances == nil {
-		return nil
-	}
-
-	// return a copy of the slice in case a renewal is triggered
-	cpy := make([]*channelInstance, len(instances))
-	copy(cpy, instances)
-
-	return instances
-}
-
 func (s *SecureChannel) LocalEndpoint() string {
 	return s.endpointURL
 }
@@ -475,21 +349,12 @@ func (s *SecureChannel) Open(ctx context.Context) error {
 	return s.open(ctx, nil, ua.SecurityTokenRequestTypeIssue)
 }
 
-func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, requestType ua.SecurityTokenRequestType) error {
-	// TODO: do something with the context
-	defer s.rcvLocker.unlock()
-
-	s.openingMu.Lock()
-	defer s.openingMu.Unlock()
-
-	if s.openingInstance != nil {
-		return errors.Errorf("sechan: invalid state. openingInstance must be nil when opening a new secure channel.")
-	}
-
+func (s *SecureChannel) open(ctx context.Context, prev *channelInstance, requestType ua.SecurityTokenRequestType) error {
 	var (
 		err       error
 		localKey  *rsa.PrivateKey
 		remoteKey *rsa.PublicKey
+		instance  *channelInstance
 	)
 
 	s.startDispatcher.Do(func() {
@@ -520,29 +385,40 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		return err
 	}
 
-	s.openingInstance = newChannelInstance(s)
+	s.dcL.Lock()
+
+	if s.decryptChannel == nil {
+		s.decryptChannel = &channelInstance{
+			sc:   s,
+			algo: algo,
+		}
+	}
+
+	s.dcL.Unlock()
+
+	instance = newChannelInstance(s)
 
 	if requestType == ua.SecurityTokenRequestTypeRenew {
+		if prev == nil {
+			return errors.New("attempted to renew a non-existent channel")
+		}
+
 		// TODO: lock? sequenceNumber++?
 		// this seems racy. if another request goes out while the other open request is in flight then won't an error
 		// be raised on the server? can the sequenceNumber be as "global" as the request ID?
-		s.openingInstance.sequenceNumber = instance.sequenceNumber
-		s.openingInstance.secureChannelID = instance.secureChannelID
+		instance.sequenceNumber = prev.sequenceNumber
+		instance.secureChannelID = prev.secureChannelID
 	}
-
-	// trigger cleanup after we are all done
-	defer func() {
-		if s.openingInstance == nil || s.openingInstance.state != channelActive {
-			debug.Printf("failed to open a new secure channel")
-		}
-		s.openingInstance = nil
-	}()
 
 	reqID := s.nextRequestID()
 
-	s.openingInstance.algo = algo
+	s.dcL.RLock()
 
-	localNonce, err := algo.MakeNonce()
+	instance.algo = s.decryptChannel.algo
+
+	s.dcL.RUnlock()
+
+	localNonce, err := instance.algo.MakeNonce()
 	if err != nil {
 		return err
 	}
@@ -555,13 +431,21 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		RequestedLifetime:     s.cfg.Lifetime,
 	}
 
-	return s.sendRequestWithTimeout(req, reqID, s.openingInstance, nil, s.cfg.RequestTimeout, func(v interface{}) error {
-		resp, ok := v.(*ua.OpenSecureChannelResponse)
-		if !ok {
-			return errors.Errorf("got %T, want OpenSecureChannelResponse", v)
-		}
-		return s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
-	})
+	resp, err := s.sendRequestWithTimeout(ctx, req, reqID, instance, nil)
+	if err != nil {
+		return err
+	}
+
+	if resp.Err != nil {
+		return resp.Err
+	}
+
+	openResp, ok := resp.V.(*ua.OpenSecureChannelResponse)
+	if !ok {
+		return errors.Errorf("got %T, want OpenSecureChannelResponse", resp.V)
+	}
+
+	return s.handleOpenSecureChannelResponse(openResp, localNonce, instance)
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
@@ -580,27 +464,14 @@ func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChann
 		return err
 	}
 
-	s.instancesMu.Lock()
-	defer s.instancesMu.Unlock()
+	s.ciL.Lock()
+	defer s.ciL.Unlock()
 
-	if _, ok := s.instances[resp.SecurityToken.ChannelID]; ok {
-		// since there's already an existing entry for this SecureChannelID it means we are in a renewal
-		s.instances[resp.SecurityToken.ChannelID] = append(
-			s.instances[resp.SecurityToken.ChannelID],
-			s.openingInstance,
-		)
-	} else {
-		s.instances[resp.SecurityToken.ChannelID] = []*channelInstance{s.openingInstance}
-	}
-
-	s.activeInstance = instance
+	s.ci = instance
 
 	debug.Printf("received security token: channelID=%d tokenID=%d createdAt=%s lifetime=%s", instance.secureChannelID, instance.securityTokenID, instance.createdAt.Format(time.RFC3339), instance.revisedLifetime)
 
-	if s.cfg.SecurityMode != ua.MessageSecurityModeNone {
-		go s.scheduleRenewal(instance)
-		go s.scheduleExpiration(instance)
-	}
+	go s.scheduleRenewal(instance)
 
 	return
 }
@@ -610,203 +481,146 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 	// Clients should request a new SecurityToken after 75 % of its lifetime has elapsed. This should ensure that
 	// clients will receive the new SecurityToken before the old one actually expire
 	const renewAfter = 0.75
-	when := time.Second * time.Duration(instance.revisedLifetime.Seconds()*renewAfter)
+	when := instance.createdAt.Add(time.Second * time.Duration(instance.revisedLifetime.Seconds()*renewAfter))
 
-	debug.Printf("channelID %d will be refreshed in %s (%s)", instance.secureChannelID, when, time.Now().UTC().Add(when).Format(time.RFC3339))
-
-	t := time.NewTimer(when)
-	defer t.Stop()
-
-	s.closingMu.RLock()
-	defer s.closingMu.RUnlock()
+	debug.Printf("channelID %d will be refreshed in %ds (%s)", instance.secureChannelID, when.Second(), when.Format(time.RFC3339))
 
 	select {
-	case <-s.closing:
+	case <-s.quit:
 		return
-	case <-t.C:
+	case <-time.After(when.Sub(time.Now())):
 	}
+
+	fmt.Println("RENEWING")
 
 	// TODO: where should this error go?
 	_ = s.renew(instance)
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
-	// lock ensure no one else renews this at the same time
-	s.reqLocker.lock()
-	defer s.reqLocker.unlock()
-	s.pendingReq.Wait()
 	instance.Lock()
 	defer instance.Unlock()
 
 	return s.open(context.Background(), instance, ua.SecurityTokenRequestTypeRenew)
 }
 
-func (s *SecureChannel) scheduleExpiration(instance *channelInstance) {
-	// https://reference.opcfoundation.org/v104/Core/docs/Part4/5.5.2/#5.5.2.1
-	// Clients should accept Messages secured by an expired SecurityToken for up to 25 % of the token lifetime.
-	const expireAfter = 1.25
-	when := instance.createdAt.Add(time.Second * time.Duration(instance.revisedLifetime.Seconds()*expireAfter))
-
-	debug.Printf("channelID %d/%d will expire at %s", instance.secureChannelID, instance.securityTokenID, when.UTC().Format(time.RFC3339))
-
-	t := time.NewTimer(time.Until(when))
-
-	s.closingMu.RLock()
-	defer s.closingMu.RUnlock()
-
-	select {
-	case <-s.closing:
-		return
-	case <-t.C:
-	}
-
-	s.instancesMu.Lock()
-	defer s.instancesMu.Unlock()
-
-	oldInstances := s.instances[instance.securityTokenID]
-
-	s.instances[instance.securityTokenID] = []*channelInstance{}
-
-	for _, oldInstance := range oldInstances {
-		if oldInstance.secureChannelID != instance.secureChannelID {
-			// something has gone horribly wrong!
-			debug.Printf("secureChannelID mismatch during scheduleExpiration!")
-		}
-		if oldInstance.securityTokenID == instance.securityTokenID {
-			continue
-		}
-		s.instances[instance.securityTokenID] = append(
-			s.instances[instance.securityTokenID],
-			oldInstance,
-		)
-	}
-}
-
 func (s *SecureChannel) sendRequestWithTimeout(
+	ctx context.Context,
 	req ua.Request,
 	reqID uint32,
 	instance *channelInstance,
-	authToken *ua.NodeID,
-	timeout time.Duration,
-	h func(interface{}) error) error {
+	authToken *ua.NodeID) (*response, error) {
 
-	s.pendingReq.Add(1)
-	respRequired := h != nil
+	var ret response
 
-	ch, err := s.sendAsyncWithTimeout(req, reqID, instance, authToken, respRequired, timeout)
-	s.pendingReq.Done()
+	ch, err := s.sendAsyncWithTimeout(ctx, req, reqID, instance, authToken)
 	if err != nil {
-		return err
+		return &ret, err
 	}
-
-	if !respRequired {
-		return nil
-	}
-
-	// `+ timeoutLeniency` to give the server a chance to respond to TimeoutHint
-	timer := time.NewTimer(timeout + timeoutLeniency)
-	defer timer.Stop()
 
 	select {
-	case <-s.disconnected:
-		s.popHandler(reqID)
-		return io.EOF
+	case <-s.quit:
+		s.popActiveRequest(reqID)
+		return nil, io.EOF
 	case resp := <-ch:
-		if resp.Err != nil {
-			if resp.V != nil {
-				_ = h(resp.V) // ignore result because resp.Err takes precedence
-			}
-			return resp.Err
-		}
-		return h(resp.V)
-	case <-timer.C:
-		s.popHandler(reqID)
-		return ua.StatusBadTimeout
+		return resp, nil
+	case <-ctx.Done():
+		s.popActiveRequest(reqID)
+		return nil, ua.StatusBadTimeout
 	}
 }
 
-func (s *SecureChannel) popHandler(reqID uint32) (chan *response, bool) {
-	s.handlersMu.Lock()
-	defer s.handlersMu.Unlock()
+func (s *SecureChannel) popActiveRequest(tokenID uint32) (chan *response, bool) {
+	s.reqL.Lock()
+	defer s.reqL.Unlock()
 
-	ch, ok := s.handlers[reqID]
+	req, ok := s.requests[tokenID]
 	if ok {
-		delete(s.handlers, reqID)
+		delete(s.requests, tokenID)
 	}
-	return ch, ok
+
+	return req.resp, ok
 }
 
 func (s *SecureChannel) Renew(ctx context.Context) error {
-	instance, err := s.getActiveChannelInstance()
-	if err != nil {
-		return err
+	s.ciL.Lock()
+	defer s.ciL.Unlock()
+
+	if s.ci != nil {
+		return errors.New("cannot renew non-existent secure channel")
 	}
 
-	return s.renew(instance)
+	return s.renew(s.ci)
 }
 
 // SendRequest sends the service request and calls h with the response.
 func (s *SecureChannel) SendRequest(req ua.Request, authToken *ua.NodeID, h func(interface{}) error) error {
-	return s.SendRequestWithTimeout(req, authToken, s.cfg.RequestTimeout, h)
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout)
+	defer cancel()
+
+	return s.SendRequestWithTimeout(ctx, req, authToken, h)
 }
 
-func (s *SecureChannel) SendRequestWithTimeout(req ua.Request, authToken *ua.NodeID, timeout time.Duration, h func(interface{}) error) error {
-	s.reqLocker.waitIfLock()
-	active, err := s.getActiveChannelInstance()
+func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, h func(interface{}) error) error {
+	s.ciL.RLock()
+	defer s.ciL.RUnlock()
+
+	if s.ci == nil {
+		return errors.New("no active secure channel instance")
+	}
+
+	respRequired := h != nil
+
+	resp, err := s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), s.ci, authToken)
 	if err != nil {
 		return err
 	}
 
-	return s.sendRequestWithTimeout(req, s.nextRequestID(), active, authToken, timeout, h)
+	if resp.Err != nil {
+		return resp.Err
+	}
+
+	if respRequired {
+		return h(resp.V)
+	}
+
+	return nil
 }
 
 func (s *SecureChannel) sendAsyncWithTimeout(
+	ctx context.Context,
 	req ua.Request,
 	reqID uint32,
 	instance *channelInstance,
 	authToken *ua.NodeID,
-	respRequired bool,
-	timeout time.Duration,
 ) (<-chan *response, error) {
 
 	instance.Lock()
+	defer instance.Unlock()
 
-	m, err := instance.newRequestMessage(req, reqID, authToken, timeout)
+	m, err := instance.newRequestMessage(ctx, req, reqID, authToken)
 	if err != nil {
-		instance.Unlock()
 		return nil, err
 	}
 
 	b, err := m.Encode()
 	if err != nil {
-		instance.Unlock()
 		return nil, err
 	}
 
 	b, err = instance.signAndEncrypt(m, b)
 	if err != nil {
-		instance.Unlock()
 		return nil, err
 	}
 
-	instance.Unlock()
-
-	var resp chan *response
-
-	if respRequired {
-		// register the handler if a callback was passed
-		resp = make(chan *response, 1)
-
-		s.handlersMu.Lock()
-
-		if s.handlers[reqID] != nil {
-			s.handlersMu.Unlock()
-			return nil, errors.Errorf("error: duplicate handler registration for request id %d", reqID)
-		}
-
-		s.handlers[reqID] = resp
-		s.handlersMu.Unlock()
+	ar := activeRequest{
+		instance: instance,
+		resp:     make(chan *response, 1),
 	}
+
+	s.reqL.Lock()
+	s.requests[reqID] = ar
+	s.reqL.Unlock()
 
 	// send the message
 	var n int
@@ -819,43 +633,32 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 
 	debug.Printf("uasc %d/%d: send %T with %d bytes", s.c.ID(), reqID, req, len(b))
 
-	return resp, nil
+	return ar.resp, nil
 }
 
 func (s *SecureChannel) nextRequestID() uint32 {
-	s.requestIDMu.Lock()
-	defer s.requestIDMu.Unlock()
-
-	s.requestID++
-	if s.requestID == 0 {
-		s.requestID = 1
+	ret := atomic.AddUint32(&s.requestID, 1)
+	if ret == 0 {
+		return atomic.AddUint32(&s.requestID, 1)
 	}
 
-	return s.requestID
+	return ret
 }
 
 // Close closes an existing secure channel
 func (s *SecureChannel) Close() error {
 	debug.Printf("uasc Close()")
 
-	defer func() {
-		close(s.closing)
-		s.reset()
-	}()
-
-	s.reqLocker.unlock()
-	s.rcvLocker.unlock()
-
-	select {
-	case <-s.disconnected:
-		return io.EOF
-	default:
-	}
 	err := s.SendRequest(&ua.CloseSecureChannelRequest{}, nil, nil)
-
 	if err != nil {
 		return err
 	}
+
+	s.ciL.Lock()
+	s.ci = nil
+	s.ciL.Unlock()
+
+	close(s.quit)
 
 	return io.EOF
 }

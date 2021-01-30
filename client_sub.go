@@ -508,9 +508,14 @@ func (c *Client) sendPublishRequest() (*ua.PublishResponse, error) {
 
 	dlog.Printf("PublishRequest: %s", debug.ToJSON(req))
 	var res *ua.PublishResponse
-	err := c.sendWithTimeout(req, c.publishTimeout, func(v interface{}) error {
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.publishTimeout)
+	defer cancel()
+
+	err := c.sendWithTimeout(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
+
 	dlog.Printf("PublishResponse: %s", debug.ToJSON(res))
 	return res, err
 }
