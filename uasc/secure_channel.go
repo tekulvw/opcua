@@ -495,6 +495,29 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 
 	// TODO: where should this error go?
 	_ = s.renew(instance)
+
+	go s.scheduleRemoval(instance)
+}
+
+func (s *SecureChannel) scheduleRemoval(inst *channelInstance) {
+	<-time.After(10 * time.Second)
+
+	s.reqL.Lock()
+	defer s.reqL.Unlock()
+
+	oldReqs := s.requests
+	removed := 0
+
+	for reqId, req := range oldReqs {
+		if req.instance == inst {
+			close(req.resp)
+			delete(s.requests, reqId)
+
+			removed++
+		}
+	}
+
+	fmt.Printf("REQUEST CLEANUP removed=%d\n", removed)
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
@@ -522,7 +545,11 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	case <-s.quit:
 		s.popActiveRequest(reqID)
 		return nil, io.EOF
-	case resp := <-ch:
+	case resp, ok := <-ch:
+		if !ok {
+			return nil, errors.New("response closed unexpectedly")
+		}
+
 		return resp, nil
 	case <-ctx.Done():
 		s.popActiveRequest(reqID)
@@ -538,6 +565,8 @@ func (s *SecureChannel) popActiveRequest(tokenID uint32) (chan *response, bool) 
 	if ok {
 		delete(s.requests, tokenID)
 	}
+
+	fmt.Printf("active requests remaining: %d\n", len(s.requests))
 
 	return req.resp, ok
 }
