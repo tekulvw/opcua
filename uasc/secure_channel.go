@@ -550,7 +550,8 @@ func (s *SecureChannel) sendRequestWithTimeout(
 		return nil, io.EOF
 	case resp, ok := <-ch:
 		if !ok {
-			return nil, errors.New("response closed unexpectedly")
+			// this signifies an interrupted response, quite likely due to a close request
+			return nil, io.EOF
 		}
 
 		return resp, nil
@@ -686,11 +687,21 @@ func (s *SecureChannel) Close() error {
 		return err
 	}
 
-	s.ciL.Lock()
-	s.ci = nil
-	s.ciL.Unlock()
-
 	close(s.quit)
+
+	s.ciL.Lock()
+	defer s.ciL.Unlock()
+
+	s.ci = nil
+
+	s.reqL.Lock()
+	defer s.reqL.Unlock()
+
+	for _, req := range s.requests {
+		close(req.resp)
+	}
+
+	s.requests = make(map[uint32]activeRequest)
 
 	return io.EOF
 }
