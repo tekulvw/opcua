@@ -454,7 +454,6 @@ func (s *SecureChannel) open(ctx context.Context, prev *channelInstance, request
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
-	instance.state = channelActive
 	instance.secureChannelID = resp.SecurityToken.ChannelID
 	instance.securityTokenID = resp.SecurityToken.TokenID
 	instance.createdAt = resp.SecurityToken.CreatedAt

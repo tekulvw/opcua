@@ -17,17 +17,9 @@ import (
 	"github.com/gopcua/opcua/uapolicy"
 )
 
-type instanceState int
-
-const (
-	channelOpening instanceState = iota
-	channelActive
-)
-
 type channelInstance struct {
 	sync.Mutex
 	sc              *SecureChannel
-	state           instanceState
 	createdAt       time.Time
 	revisedLifetime time.Duration
 	secureChannelID uint32
@@ -43,8 +35,7 @@ type channelInstance struct {
 
 func newChannelInstance(sc *SecureChannel) *channelInstance {
 	return &channelInstance{
-		sc:    sc,
-		state: channelOpening,
+		sc: sc,
 	}
 }
 
