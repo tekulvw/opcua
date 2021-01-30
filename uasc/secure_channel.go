@@ -23,8 +23,7 @@ import (
 )
 
 const (
-	timeoutLeniency = 250 * time.Millisecond
-	MaxTimeout      = math.MaxUint32 * time.Millisecond
+	MaxTimeout = math.MaxUint32 * time.Millisecond
 )
 
 type response struct {
@@ -57,13 +56,17 @@ type SecureChannel struct {
 	// requestID is a "global" counter shared between multiple channels and tokens
 	requestID uint32
 
-	// instances maps secure channel IDs to a list to channel states
+	// ci is the currently active channel instance
 	ci  *channelInstance
 	ciL sync.RWMutex
 
+	// decryptChannel is used as a single source for decrypting incoming messages.
+	// This should be possible to use as long as the security settings remain constant
+	// for a single SecureChannel throughout the lifetime of the connection.
 	decryptChannel *channelInstance
 	dcL            sync.RWMutex
 
+	// requests maps request IDs to an instance and response channel
 	requests map[uint32]activeRequest
 	reqL     sync.Mutex
 
@@ -387,6 +390,8 @@ func (s *SecureChannel) open(ctx context.Context, prev *channelInstance, request
 
 	s.dcL.Lock()
 
+	// this is possible only as long as the assumption that security settings will not change
+	// for a single session holds. Please keep it, it massively simplifies instance management
 	if s.decryptChannel == nil {
 		s.decryptChannel = &channelInstance{
 			sc:   s,
@@ -488,7 +493,7 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 	select {
 	case <-s.quit:
 		return
-	case <-time.After(when.Sub(time.Now())):
+	case <-time.After(time.Until(when)):
 	}
 
 	fmt.Println("RENEWING")
@@ -534,11 +539,9 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	instance *channelInstance,
 	authToken *ua.NodeID) (*response, error) {
 
-	var ret response
-
 	ch, err := s.sendAsyncWithTimeout(ctx, req, reqID, instance, authToken)
 	if err != nil {
-		return &ret, err
+		return nil, err
 	}
 
 	select {

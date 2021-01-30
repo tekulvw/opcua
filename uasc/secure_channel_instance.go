@@ -75,15 +75,10 @@ func (c *channelInstance) newRequestMessage(ctx context.Context, req ua.Request,
 
 	var timeoutHint uint32
 
-	if when, set := ctx.Deadline(); set && when.Sub(time.Now()) < c.sc.cfg.RequestTimeout {
-		var cancel context.CancelFunc
-
-		ctx, cancel = context.WithTimeout(context.Background(), c.sc.cfg.RequestTimeout)
-		defer cancel()
-
+	if when, set := ctx.Deadline(); set && time.Until(when) < c.sc.cfg.RequestTimeout {
 		timeoutHint = uint32(c.sc.cfg.RequestTimeout / time.Millisecond)
 	} else if set {
-		timeoutHint = uint32(when.Sub(time.Now()) / time.Millisecond)
+		timeoutHint = uint32(time.Until(when) / time.Millisecond)
 	}
 
 	reqHdr.TimeoutHint = timeoutHint
