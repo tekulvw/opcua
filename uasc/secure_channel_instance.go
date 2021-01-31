@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/gopcua/opcua/errors"
@@ -18,7 +17,6 @@ import (
 )
 
 type channelInstance struct {
-	sync.Mutex
 	sc              *SecureChannel
 	createdAt       time.Time
 	revisedLifetime time.Duration

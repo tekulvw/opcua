@@ -164,7 +164,7 @@ func (c *Client) sendRepublishRequests(sub *Subscription, availableSeq []uint32)
 
 		debug.Printf("RepublishRequest: req=%s", debug.ToJSON(req))
 		var res *ua.RepublishResponse
-		err := c.sechan.SendRequest(req, c.Session().resp.AuthenticationToken, func(v interface{}) error {
+		err := c.sc.SendRequest(req, c.Session().resp.AuthenticationToken, func(v interface{}) error {
 			return safeAssign(v, &res)
 		})
 		debug.Printf("RepublishResponse: res=%s err=%v", debug.ToJSON(res), err)

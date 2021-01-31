@@ -175,7 +175,7 @@ func (s *SecureChannel) receive() (*response, error) {
 			if err == io.EOF {
 				debug.Printf("uasc readChunk EOF")
 				return nil, err
-			} else if err.(net.Error) != nil {
+			} else if _, ok := err.(net.Error); ok {
 				return nil, err
 			} else if err != nil {
 				return &response{Err: err}, nil
@@ -517,9 +517,6 @@ func (s *SecureChannel) scheduleRemoval(inst *channelInstance) {
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
-	instance.Lock()
-	defer instance.Unlock()
-
 	return s.open(context.Background(), instance, ua.SecurityTokenRequestTypeRenew)
 }
 
@@ -618,9 +615,6 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	instance *channelInstance,
 	authToken *ua.NodeID,
 ) (<-chan *response, error) {
-
-	instance.Lock()
-	defer instance.Unlock()
 
 	m, err := instance.newRequestMessage(ctx, req, reqID, authToken)
 	if err != nil {

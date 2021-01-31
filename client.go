@@ -112,12 +112,14 @@ type Client struct {
 	// conn is the open connection
 	conn *uacp.Conn
 
-	// sechan is the open secure channel.
-	sechan    *uasc.SecureChannel
-	sechanErr chan error
+	// sc is the open secure channel.
+	sc    *uasc.SecureChannel
+	scErr chan error
+	scL   sync.RWMutex
 
 	// session is the active session.
-	session atomic.Value // *Session
+	session  *Session
+	sessionL sync.Mutex
 
 	// subs is the set of active subscriptions by id.
 	subs   map[uint32]*Subscription
@@ -159,7 +161,7 @@ func NewClient(endpoint string, opts ...Option) *Client {
 		endpointURL:    endpoint,
 		cfg:            cfg,
 		sessionCfg:     sessionCfg,
-		sechanErr:      make(chan error, 1),
+		scErr:          make(chan error),
 		subs:           make(map[uint32]*Subscription),
 		pausech:        make(chan struct{}, 2),
 		resumech:       make(chan struct{}, 2),
@@ -182,7 +184,6 @@ const (
 	recreateSession       // ask the client to repair session
 	restoreSubscriptions  // republish or recreate subscriptions
 	transferSubscriptions // move subscriptions from one session to another
-	abortReconnect        // the reconnecting is not possible
 )
 
 // Connect establishes a secure channel and creates a new session.
@@ -191,7 +192,7 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		ctx = context.Background()
 	}
 
-	if c.sechan != nil {
+	if c.sc != nil {
 		return errors.Errorf("already connected")
 	}
 
@@ -230,259 +231,223 @@ func (c *Client) monitor(ctx context.Context) {
 	defer c.mcancel()
 	defer c.state.Store(Closed)
 
-	action := none
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case err, ok := <-c.sechanErr:
-			// return if channel or connection is closed
-			if !ok || err == io.EOF && c.State() == Closed {
-				dlog.Print("closed")
-				return
-			}
-
+	for err := range c.scErr {
+		if c.state.Load().(ConnState) == Connected {
 			// tell the handler the connection is disconnected
 			c.state.Store(Disconnected)
 			dlog.Print("disconnected")
 
-			if !c.cfg.AutoReconnect {
-				// the connection is closed and should not be restored
-				action = abortReconnect
-				dlog.Print("auto-reconnect disabled")
-				return
-			}
-
-			dlog.Print("auto-reconnecting")
-
-			switch err {
-			case io.EOF:
-				// the connection has been closed
-				action = createSecureChannel
-
-			case syscall.ECONNREFUSED:
-				// the connection has been refused by the server
-				action = abortReconnect
-
-			default:
-				switch x := err.(type) {
-				case *uacp.Error:
-					switch ua.StatusCode(x.ErrorCode) {
-					case ua.StatusBadSecureChannelIDInvalid:
-						// the secure channel has been rejected by the server
-						action = createSecureChannel
-
-					case ua.StatusBadSessionIDInvalid:
-						// the session has been rejected by the server
-						action = recreateSession
-
-					case ua.StatusBadSubscriptionIDInvalid:
-						// the subscription has been rejected by the server
-						action = transferSubscriptions
-
-					case ua.StatusBadCertificateInvalid:
-						// todo(unknownet): recreate server certificate
-						fallthrough
-
-					default:
-						// unknown error has occured
-						action = createSecureChannel
-					}
-
-				default:
-					// unknown error has occured
-					action = createSecureChannel
-				}
-			}
-
-			c.state.Store(Disconnected)
-
-			c.pauseSubscriptions()
-
-			var (
-				subsToRepublish []uint32 // subscription ids for which to send republish requests
-				subsToRecreate  []uint32 // subscription ids which need to be recreated as new subscriptions
-				availableSeqs   map[uint32][]uint32
-			)
-
-			for action != none {
-
-				select {
-				case <-ctx.Done():
-					return
-
-				default:
-					switch action {
-
-					case createSecureChannel:
-						dlog.Printf("action: createSecureChannel")
-
-						// recreate a secure channel by brute forcing
-						// a reconnection to the server
-
-						// close previous secure channel
-						_ = c.conn.Close()
-						c.sechan.Close()
-						c.sechan = nil
-
-						c.state.Store(Reconnecting)
-
-						dlog.Printf("trying to recreate secure channel")
-						for {
-							if err := c.Dial(ctx); err != nil {
-								select {
-								case <-ctx.Done():
-									return
-								case <-time.After(c.cfg.ReconnectInterval):
-									dlog.Printf("trying to recreate secure channel")
-									continue
-								}
-							}
-							break
-						}
-						dlog.Printf("secure channel recreated")
-						action = restoreSession
-
-					case restoreSession:
-						dlog.Printf("action: restoreSession")
-
-						// try to reactivate the session,
-						// This only works if the session is still open on the server
-						// otherwise recreate it
-
-						dlog.Printf("trying to restore session")
-						s, err := c.DetachSession()
-						if err != nil {
-							action = createSecureChannel
-							continue
-						}
-						if err := c.ActivateSession(s); err != nil {
-							dlog.Printf("restore session failed")
-							action = recreateSession
-							continue
-						}
-						dlog.Printf("session restored")
-						action = restoreSubscriptions
-
-					case recreateSession:
-						dlog.Printf("action: recreateSession")
-
-						// create a new session to replace the previous one
-
-						dlog.Printf("trying to recreate session")
-						s, err := c.CreateSession(c.sessionCfg)
-						if err != nil {
-							dlog.Printf("recreate session failed: %v", err)
-							action = createSecureChannel
-							continue
-						}
-						if err := c.ActivateSession(s); err != nil {
-							dlog.Printf("reactivate session failed: %v", err)
-							action = createSecureChannel
-							continue
-						}
-						action = transferSubscriptions
-
-					case transferSubscriptions:
-						dlog.Printf("action: transferSubscriptions")
-
-						// transfer subscriptions from the old to the new session
-						// and try to republish the subscriptions.
-						// Restore the subscriptions where republishing fails.
-
-						subIDs := c.SubscriptionIDs()
-
-						availableSeqs = map[uint32][]uint32{}
-						subsToRecreate = nil
-						subsToRepublish = nil
-
-						// try to transfer all subscriptions to the new session and
-						// recreate them all if that fails.
-						res, err := c.transferSubscriptions(subIDs)
-						switch {
-						case err != nil:
-							dlog.Printf("transfer subscriptions failed. Recreating all subscriptions: %v", err)
-							subsToRepublish = nil
-							subsToRecreate = subIDs
-
-						default:
-							// otherwise, try a republish for the subscriptions that were transferred
-							// and recreate the rest.
-							for i := range res.Results {
-								transferResult := res.Results[i]
-								switch transferResult.StatusCode {
-								case ua.StatusBadSubscriptionIDInvalid:
-									dlog.Printf("sub %d: transfer subscription failed", subIDs[i])
-									subsToRecreate = append(subsToRecreate, subIDs[i])
-
-								default:
-									subsToRepublish = append(subsToRepublish, subIDs[i])
-									availableSeqs[subIDs[i]] = transferResult.AvailableSequenceNumbers
-								}
-							}
-						}
-
-						action = restoreSubscriptions
-
-					case restoreSubscriptions:
-						dlog.Printf("action: restoreSubscriptions")
-
-						// try to republish the previous subscriptions from the server
-						// otherwise restore them.
-						// Assume that subsToRecreate and subsToRepublish have been
-						// populated in the previous step.
-
-						for _, id := range subsToRepublish {
-							if err := c.republishSubscription(id, availableSeqs[id]); err != nil {
-								dlog.Printf("republish of subscription %d failed", id)
-								subsToRecreate = append(subsToRecreate, id)
-							}
-						}
-
-						for _, id := range subsToRecreate {
-							if err := c.recreateSubscription(id); err != nil {
-								dlog.Printf("recreate subscripitions failed: %v", err)
-								action = recreateSession
-								continue
-							}
-						}
-
-						c.state.Store(Connected)
-						action = none
-
-					case abortReconnect:
-						dlog.Printf("action: abortReconnect")
-
-						// non recoverable disconnection
-						// stop the client
-
-						// todo(unknownet): should we store the error?
-						dlog.Printf("reconnection not recoverable")
-						return
-					}
-				}
-			}
-
-			// clear sechan errors from reconnection
-			for len(c.sechanErr) > 0 {
-				<-c.sechanErr
-			}
-
-			dlog.Printf("resuming subscriptions")
-			c.resumeSubscriptions()
-			dlog.Printf("resumed subscriptions")
+			c.handleReconnect(ctx, err)
 		}
 	}
 }
 
+func (c *Client) handleReconnect(ctx context.Context, err error) {
+	action := none
+	dlog := debug.NewPrefixLogger("client: monitor: reconnect: ")
+
+	if !c.cfg.AutoReconnect {
+		// the connection is closed and should not be restored
+		dlog.Print("auto-reconnect disabled")
+		return
+	}
+
+	switch err {
+	case io.EOF:
+		// the connection has been closed
+		action = createSecureChannel
+	case syscall.ECONNREFUSED:
+		// the connection has been refused by the server
+		return
+	}
+
+	dlog.Print("auto-reconnecting")
+
+	switch x := err.(type) {
+	case *uacp.Error:
+		switch ua.StatusCode(x.ErrorCode) {
+		case ua.StatusBadSecureChannelIDInvalid:
+			// the secure channel has been rejected by the server
+			action = createSecureChannel
+		case ua.StatusBadSessionIDInvalid:
+			// the session has been rejected by the server
+			action = recreateSession
+		case ua.StatusBadSubscriptionIDInvalid:
+			// the subscription has been rejected by the server
+			action = transferSubscriptions
+		case ua.StatusBadCertificateInvalid:
+			// todo(unknownet): recreate server certificate
+			fallthrough
+		default:
+			// unknown error has occured
+			action = createSecureChannel
+		}
+	default:
+		// unknown error has occured
+		action = createSecureChannel
+	}
+
+	c.pauseSubscriptions()
+
+	var (
+		subsToRepublish []uint32 // subscription ids for which to send republish requests
+		subsToRecreate  []uint32 // subscription ids which need to be recreated as new subscriptions
+		availableSeqs   map[uint32][]uint32
+	)
+
+	for action != none {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		switch action {
+		case createSecureChannel:
+			dlog.Printf("action: createSecureChannel")
+
+			// recreate a secure channel by brute forcing
+			// a reconnection to the server
+
+			// close previous secure channel
+			_ = c.conn.Close()
+			c.sc.Close()
+			c.sc = nil
+
+			c.state.Store(Reconnecting)
+
+			dlog.Printf("trying to recreate secure channel")
+
+			for {
+				if err := c.Dial(ctx); err == nil {
+					break
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(c.cfg.ReconnectInterval):
+					dlog.Printf("trying to recreate secure channel")
+					continue
+				}
+			}
+
+			dlog.Printf("secure channel recreated")
+			action = restoreSession
+		case restoreSession:
+			dlog.Printf("action: restoreSession")
+
+			// try to reactivate the session,
+			// This only works if the session is still open on the server
+			// otherwise recreate it
+
+			dlog.Printf("trying to restore session")
+			s := c.DetachSession()
+
+			if err := c.ActivateSession(s); err != nil {
+				dlog.Printf("restore session failed")
+				action = recreateSession
+				continue
+			}
+			dlog.Printf("session restored")
+			action = restoreSubscriptions
+
+		case recreateSession:
+			dlog.Printf("action: recreateSession")
+
+			// create a new session to replace the previous one
+
+			dlog.Printf("trying to recreate session")
+			s, err := c.CreateSession(c.sessionCfg)
+			if err != nil {
+				dlog.Printf("recreate session failed: %v", err)
+				action = createSecureChannel
+				continue
+			}
+			if err := c.ActivateSession(s); err != nil {
+				dlog.Printf("reactivate session failed: %v", err)
+				action = createSecureChannel
+				continue
+			}
+			action = transferSubscriptions
+
+		case transferSubscriptions:
+			dlog.Printf("action: transferSubscriptions")
+
+			// transfer subscriptions from the old to the new session
+			// and try to republish the subscriptions.
+			// Restore the subscriptions where republishing fails.
+
+			subIDs := c.SubscriptionIDs()
+
+			availableSeqs = make(map[uint32][]uint32)
+			subsToRecreate = nil
+			subsToRepublish = nil
+
+			// try to transfer all subscriptions to the new session and
+			// recreate them all if that fails.
+			res, err := c.transferSubscriptions(subIDs)
+			if err != nil {
+				dlog.Printf("transfer subscriptions failed. Recreating all subscriptions: %v", err)
+				subsToRepublish = nil
+				subsToRecreate = subIDs
+			} else {
+				// otherwise, try a republish for the subscriptions that were transferred
+				// and recreate the rest.
+				for i := range res.Results {
+					transferResult := res.Results[i]
+
+					switch transferResult.StatusCode {
+					case ua.StatusBadSubscriptionIDInvalid:
+						dlog.Printf("sub %d: transfer subscription failed", subIDs[i])
+						subsToRecreate = append(subsToRecreate, subIDs[i])
+					default:
+						subsToRepublish = append(subsToRepublish, subIDs[i])
+						availableSeqs[subIDs[i]] = transferResult.AvailableSequenceNumbers
+					}
+				}
+			}
+
+			action = restoreSubscriptions
+		case restoreSubscriptions:
+			dlog.Printf("action: restoreSubscriptions")
+
+			// try to republish the previous subscriptions from the server
+			// otherwise restore them.
+			// Assume that subsToRecreate and subsToRepublish have been
+			// populated in the previous step.
+
+			for _, subId := range subsToRepublish {
+				if err := c.republishSubscription(subId, availableSeqs[subId]); err != nil {
+					dlog.Printf("republish of subscription %d failed", subId)
+					subsToRecreate = append(subsToRecreate, subId)
+				}
+			}
+
+			for _, subId := range subsToRecreate {
+				if err := c.recreateSubscription(subId); err != nil {
+					dlog.Printf("recreate subscripitions failed: %v", err)
+					action = recreateSession
+					continue
+				}
+			}
+
+			c.state.Store(Connected)
+			action = none
+		}
+	}
+
+	dlog.Printf("resuming subscriptions")
+	c.resumeSubscriptions()
+	dlog.Printf("resumed subscriptions")
+}
+
 // Dial establishes a secure channel.
 func (c *Client) Dial(ctx context.Context) error {
-	c.sessionOnce.Do(func() {
-		c.session.Store((*Session)(nil))
-	})
+	c.scL.Lock()
+	defer c.scL.Unlock()
 
-	if c.sechan != nil {
+	if c.sc != nil {
 		return errors.Errorf("secure channel already connected")
 	}
 
@@ -492,13 +457,13 @@ func (c *Client) Dial(ctx context.Context) error {
 		return err
 	}
 
-	c.sechan, err = uasc.NewSecureChannel(c.endpointURL, c.conn, c.cfg, c.sechanErr)
+	c.sc, err = uasc.NewSecureChannel(c.endpointURL, c.conn, c.cfg, c.scErr)
 	if err != nil {
 		_ = c.conn.Close()
 		return err
 	}
 
-	return c.sechan.Open(ctx)
+	return c.sc.Open(ctx)
 }
 
 // Close closes the session and the secure channel.
@@ -509,12 +474,12 @@ func (c *Client) Close() error {
 	// so that we close the underlying channel and connection.
 	c.CloseSession()
 	c.state.Store(Closed)
-	defer close(c.sechanErr)
+	defer close(c.scErr)
 	if c.mcancel != nil {
 		c.mcancel()
 	}
-	if c.sechan != nil {
-		c.sechan.Close()
+	if c.sc != nil {
+		c.sc.Close()
 	}
 
 	return nil
@@ -526,7 +491,10 @@ func (c *Client) State() ConnState {
 
 // Session returns the active session.
 func (c *Client) Session() *Session {
-	return c.session.Load().(*Session)
+	c.sessionL.Lock()
+	defer c.sessionL.Unlock()
+
+	return c.session
 }
 
 // sessionClosed returns true when there is no session.
@@ -563,7 +531,7 @@ type Session struct {
 //
 // See Part 4, 5.6.2
 func (c *Client) CreateSession(cfg *uasc.SessionConfig) (*Session, error) {
-	if c.sechan == nil {
+	if c.sc == nil {
 		return nil, ua.StatusBadServerNotConnected
 	}
 
@@ -588,14 +556,14 @@ func (c *Client) CreateSession(cfg *uasc.SessionConfig) (*Session, error) {
 
 	var s *Session
 	// for the CreateSessionRequest the authToken is always nil.
-	// use c.sechan.SendRequest() to enforce this.
-	err := c.sechan.SendRequest(req, nil, func(v interface{}) error {
+	// use c.sc.SendRequest() to enforce this.
+	err := c.sc.SendRequest(req, nil, func(v interface{}) error {
 		var res *ua.CreateSessionResponse
 		if err := safeAssign(v, &res); err != nil {
 			return err
 		}
 
-		err := c.sechan.VerifySessionSignature(res.ServerCertificate, nonce, res.ServerSignature.Signature)
+		err := c.sc.VerifySessionSignature(res.ServerCertificate, nonce, res.ServerSignature.Signature)
 		if err != nil {
 			log.Printf("error verifying session signature: %s", err)
 			return nil
@@ -647,10 +615,14 @@ func anonymousPolicyID(endpoints []*ua.EndpointDescription) string {
 //
 // See Part 4, 5.6.3
 func (c *Client) ActivateSession(s *Session) error {
-	if c.sechan == nil {
+	c.scL.RLock()
+	defer c.scL.RUnlock()
+
+	if c.sc == nil {
 		return ua.StatusBadServerNotConnected
 	}
-	sig, sigAlg, err := c.sechan.NewSessionSignature(s.serverCertificate, s.serverNonce)
+
+	sig, sigAlg, err := c.sc.NewSessionSignature(s.serverCertificate, s.serverNonce)
 	if err != nil {
 		log.Printf("error creating session signature: %s", err)
 		return nil
@@ -661,7 +633,7 @@ func (c *Client) ActivateSession(s *Session) error {
 		// nothing to do
 
 	case *ua.UserNameIdentityToken:
-		pass, passAlg, err := c.sechan.EncryptUserPassword(s.cfg.AuthPolicyURI, s.cfg.AuthPassword, s.serverCertificate, s.serverNonce)
+		pass, passAlg, err := c.sc.EncryptUserPassword(s.cfg.AuthPolicyURI, s.cfg.AuthPassword, s.serverCertificate, s.serverNonce)
 		if err != nil {
 			log.Printf("error encrypting user password: %s", err)
 			return err
@@ -670,7 +642,7 @@ func (c *Client) ActivateSession(s *Session) error {
 		tok.EncryptionAlgorithm = passAlg
 
 	case *ua.X509IdentityToken:
-		tokSig, tokSigAlg, err := c.sechan.NewUserTokenSignature(s.cfg.AuthPolicyURI, s.serverCertificate, s.serverNonce)
+		tokSig, tokSigAlg, err := c.sc.NewUserTokenSignature(s.cfg.AuthPolicyURI, s.serverCertificate, s.serverNonce)
 		if err != nil {
 			log.Printf("error creating session signature: %s", err)
 			return err
@@ -694,7 +666,11 @@ func (c *Client) ActivateSession(s *Session) error {
 		UserIdentityToken:          ua.NewExtensionObject(s.cfg.UserIdentityToken),
 		UserTokenSignature:         s.cfg.UserTokenSignature,
 	}
-	return c.sechan.SendRequest(req, s.resp.AuthenticationToken, func(v interface{}) error {
+
+	c.sessionL.Lock()
+	defer c.sessionL.Unlock()
+
+	return c.sc.SendRequest(req, s.resp.AuthenticationToken, func(v interface{}) error {
 		var res *ua.ActivateSessionResponse
 		if err := safeAssign(v, &res); err != nil {
 			return err
@@ -703,13 +679,17 @@ func (c *Client) ActivateSession(s *Session) error {
 		// save the nonce for the next request
 		s.serverNonce = res.ServerNonce
 
-		if err := c.CloseSession(); err != nil {
+		if err := c.closeSession(c.session); err != nil {
+			c.session = nil
 			// try to close the newly created session but report
 			// only the initial error.
 			_ = c.closeSession(s)
+
 			return err
 		}
-		c.session.Store(s)
+
+		c.session = s
+
 		return nil
 	})
 }
@@ -718,10 +698,16 @@ func (c *Client) ActivateSession(s *Session) error {
 //
 // See Part 4, 5.6.4
 func (c *Client) CloseSession() error {
-	if err := c.closeSession(c.Session()); err != nil {
+	c.sessionL.Lock()
+	defer c.sessionL.Unlock()
+
+	s := c.session
+	c.session = nil
+
+	if err := c.closeSession(s); err != nil {
 		return err
 	}
-	c.session.Store((*Session)(nil))
+
 	return nil
 }
 
@@ -730,8 +716,11 @@ func (c *Client) closeSession(s *Session) error {
 	if s == nil {
 		return nil
 	}
+
 	req := &ua.CloseSessionRequest{DeleteSubscriptions: true}
+
 	var res *ua.CloseSessionResponse
+
 	return c.Send(req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
@@ -740,10 +729,14 @@ func (c *Client) closeSession(s *Session) error {
 // DetachSession removes the session from the client without closing it. The
 // caller is responsible to close or re-activate the session. If the client
 // does not have an active session the function returns no error.
-func (c *Client) DetachSession() (*Session, error) {
-	s := c.Session()
-	c.session.Store((*Session)(nil))
-	return s, nil
+func (c *Client) DetachSession() *Session {
+	c.sessionL.Lock()
+	defer c.sessionL.Unlock()
+
+	ret := c.session
+	c.session = nil
+
+	return ret
 }
 
 // Send sends the request via the secure channel and registers a handler for
@@ -760,14 +753,20 @@ func (c *Client) Send(req ua.Request, h func(interface{}) error) error {
 // the response. If the client has an active session it injects the
 // authentication token.
 func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, h func(interface{}) error) error {
-	if c.sechan == nil {
+	c.scL.RLock()
+	defer c.scL.RUnlock()
+
+	if c.sc == nil {
 		return ua.StatusBadServerNotConnected
 	}
+
 	var authToken *ua.NodeID
+
 	if s := c.Session(); s != nil {
 		authToken = s.resp.AuthenticationToken
 	}
-	return c.sechan.SendRequestWithTimeout(ctx, req, authToken, h)
+
+	return c.sc.SendRequestWithTimeout(ctx, req, authToken, h)
 }
 
 // Node returns a node object which accesses its attributes
