@@ -679,6 +679,7 @@ func (s *SecureChannel) Close() error {
 	}
 
 	close(s.quit)
+	close(s.errCh)
 
 	s.ciL.Lock()
 	defer s.ciL.Unlock()
