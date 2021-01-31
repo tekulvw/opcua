@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,69 +125,60 @@ func (s *SecureChannel) reset() {
 }
 
 func (s *SecureChannel) dispatcher() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	for {
 		select {
 		case <-s.quit:
 			return
 		default:
-			resp := s.receive(ctx)
-
-			if resp.Err != nil {
-				select {
-				case s.errCh <- resp.Err:
-				default:
-				}
-			}
-
-			if resp.Err == io.EOF {
+			resp, err := s.receive()
+			if err != nil {
+				s.errCh <- err
 				return
 			}
 
-			if resp.Err != nil {
-				debug.Printf("uasc %d/%d: err: %v", s.c.ID(), resp.ReqID, resp.Err)
-			} else {
-				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
-			}
-
-			ch, ok := s.popActiveRequest(resp.ReqID)
-
-			if !ok {
-				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), resp.ReqID, resp.V)
-				continue
-			}
-
-			debug.Printf("sending %T to handler\n", resp.V)
-			select {
-			case ch <- resp:
-			default:
-				// this should never happen since the chan is of size one
-				debug.Printf("unexpected state. channel write should always succeed.")
-			}
+			go s.handleResponse(resp)
 		}
 	}
 }
 
+func (s *SecureChannel) handleResponse(resp *response) {
+	if resp.Err != nil {
+		debug.Printf("uasc %d/%d: err: %v", s.c.ID(), resp.ReqID, resp.Err)
+	} else {
+		debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
+	}
+
+	ch, ok := s.popActiveRequest(resp.ReqID)
+
+	if !ok {
+		debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), resp.ReqID, resp.V)
+		return
+	}
+
+	debug.Printf("sending %T to handler\n", resp.V)
+
+	ch <- resp
+}
+
 // receive receives message chunks from the secure channel, decodes and forwards
 // them to the registered callback channel, if there is one. Otherwise,
-// the message is dropped.
-func (s *SecureChannel) receive(ctx context.Context) *response {
+// the message is dropped. The returned error here indicates a transport level error,
+// some issue with the network that cannot be resolved. It is explicitly NOT an OPC
+// UA protocol level error!
+func (s *SecureChannel) receive() (*response, error) {
 	for {
 		select {
-		case <-ctx.Done():
-			return &response{Err: ctx.Err()}
-
+		case <-s.quit:
+			return nil, io.EOF
 		default:
 			chunk, err := s.readChunk()
 			if err == io.EOF {
 				debug.Printf("uasc readChunk EOF")
-				return &response{Err: err}
-			}
-
-			if err != nil {
-				return &response{Err: err}
+				return nil, err
+			} else if err.(net.Error) != nil {
+				return nil, err
+			} else if err != nil {
+				return &response{Err: err}, nil
 			}
 
 			hdr := chunk.Header
@@ -210,10 +202,10 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 				if _, err := msga.Decode(chunk.Data); err != nil {
 					debug.Printf("conn %d/%d: invalid MSGA chunk. %s", s.c.ID(), reqID, err)
 					resp.Err = ua.StatusBadDecodingError
-					return resp
+					return resp, nil
 				}
 
-				return &response{ReqID: reqID, Err: ua.StatusCode(msga.ErrorCode)}
+				return &response{ReqID: reqID, Err: ua.StatusCode(msga.ErrorCode)}, nil
 
 			case 'C':
 				s.chunks[reqID] = append(s.chunks[reqID], chunk)
@@ -221,7 +213,7 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 					delete(s.chunks, reqID)
 					s.chunksMu.Unlock()
 					resp.Err = errors.Errorf("too many chunks: %d > %d", n, s.c.MaxChunkCount())
-					return resp
+					return resp, nil
 				}
 				s.chunksMu.Unlock()
 				continue
@@ -236,12 +228,12 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 			b, err := mergeChunks(all)
 			if err != nil {
 				resp.Err = err
-				return resp
+				return resp, nil
 			}
 
 			if uint32(len(b)) > s.c.MaxMessageSize() {
 				resp.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.c.MaxMessageSize())
-				return resp
+				return resp, nil
 			}
 
 			// since we are not decoding the ResponseHeader separately
@@ -254,7 +246,7 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 			_, svc, err := ua.DecodeService(b)
 			if err != nil {
 				resp.Err = err
-				return resp
+				return resp, nil
 			}
 
 			resp.V = svc
@@ -264,11 +256,11 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 			if r, ok := svc.(ua.Response); ok {
 				if status := r.Header().ServiceResult; status != ua.StatusOK {
 					resp.Err = status
-					return resp
+					return resp, nil
 				}
 			}
 
-			return resp
+			return resp, nil
 		}
 	}
 }
