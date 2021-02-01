@@ -490,7 +490,9 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 	fmt.Println("RENEWING")
 
 	// TODO: where should this error go?
-	_ = s.renew(instance)
+	if err := s.renew(instance); err != nil {
+		s.errCh <- err
+	}
 
 	go s.scheduleRemoval(instance)
 }
@@ -558,20 +560,21 @@ func (s *SecureChannel) popActiveRequest(tokenID uint32) (chan *response, bool) 
 		delete(s.requests, tokenID)
 	}
 
-	fmt.Printf("active requests remaining: %d\n", len(s.requests))
-
 	return req.resp, ok
 }
 
 func (s *SecureChannel) Renew(ctx context.Context) error {
-	s.ciL.Lock()
-	defer s.ciL.Unlock()
+	s.ciL.RLock()
 
 	if s.ci != nil {
 		return errors.New("cannot renew non-existent secure channel")
 	}
 
-	return s.renew(s.ci)
+	instance := s.ci
+
+	s.ciL.RUnlock()
+
+	return s.renew(instance)
 }
 
 // SendRequest sends the service request and calls h with the response.
@@ -584,15 +587,18 @@ func (s *SecureChannel) SendRequest(req ua.Request, authToken *ua.NodeID, h func
 
 func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, h func(interface{}) error) error {
 	s.ciL.RLock()
-	defer s.ciL.RUnlock()
 
 	if s.ci == nil {
 		return errors.New("no active secure channel instance")
 	}
 
+	instance := s.ci
+
+	s.ciL.RUnlock()
+
 	respRequired := h != nil
 
-	resp, err := s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), s.ci, authToken)
+	resp, err := s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), instance, authToken)
 	if err != nil {
 		return err
 	}
@@ -643,6 +649,10 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	// send the message
 	var n int
 	if n, err = s.c.Write(b); err != nil {
+		if _, ok := err.(net.Error); ok {
+			s.errCh <- err
+		}
+
 		return nil, err
 	}
 

@@ -168,8 +168,10 @@ func NewClient(endpoint string, opts ...Option) *Client {
 		pendingAcks:    []*ua.SubscriptionAcknowledgement{},
 		publishTimeout: uasc.MaxTimeout,
 	}
+
 	c.pauseSubscriptions()
 	c.state.Store(Closed)
+
 	return &c
 }
 
